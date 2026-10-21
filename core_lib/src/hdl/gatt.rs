@@ -210,9 +210,11 @@ async fn weave_session(
     let (mut weave_rd, mut weave_wr) = tokio::io::split(weave_side);
     let isender = sender.clone();
     tokio::spawn(async move {
+        // A unique id per session, so overlapping transfers don't collide in
+        // the UI (which keys transfers by this id).
         let mut ir = InboundRequest::new(
             crate::hdl::MigratableStream::Ble(inbound_side),
-            "ble-weave".to_string(),
+            format!("ble-weave-{:08x}", rand::random::<u32>()),
             isender,
         );
         ir.set_bwu_tcp_port(tcp_port);
