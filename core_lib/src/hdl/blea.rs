@@ -80,7 +80,11 @@ const QS_EINFO_IDENTITY: [u8; 16] = [
     0x4a, 0x22, 0x71, 0x16, 0x9c, 0x15, 0x99, 0xa2, 0x44, 0xaf, 0x44, 0xb0, 0x17, 0x9c, 0x0f, 0x23,
 ];
 // Connections advertisement trailer after endpoint_info: bluetooth MAC(6) + extra(2).
-const QS_CONN_MAC_EXTRA: [u8; 8] = [0xfc, 0x41, 0x16, 0xb6, 0x17, 0x20, 0x00, 0x00];
+// The MAC is left all-zero ("not set"): a set MAC makes the phone also register us
+// as a Bluetooth Classic endpoint and, since Nearby tries BLUETOOTH before BLE,
+// page that address first. We have no Classic socket (and the MAC copied from the
+// Pixel capture isn't ours), so that cost a 5-10 s page timeout on every send.
+const QS_CONN_MAC_EXTRA: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 // Mediums advertisement trailer: device_token(2) + extra(1) + appended presence DEs.
 const QS_MEDIUMS_TRAILING: [u8; 69] = [
     0x62, 0xf1, 0x03, 0x00, 0x82, 0x3f, 0xa0, 0x17, 0xfd, 0xf1, 0x70, 0x59, 0x6e, 0x1e, 0xd3, 0x4d,
