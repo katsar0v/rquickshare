@@ -167,6 +167,11 @@ impl ReceiverAdvertiser {
                 // (BlueZ defaults to a slow ~1-2s interval).
                 min_interval: Some(std::time::Duration::from_millis(100)),
                 max_interval: Some(std::time::Duration::from_millis(150)),
+                // The ~125-byte service data only fits an extended (non-legacy)
+                // advertising PDU; without a secondary channel the kernel uses a
+                // legacy PDU (31-byte limit) and rejects the set with
+                // "Invalid Parameters" (seen on an Intel controller, BlueZ 5.72).
+                secondary_channel: Some(bluer::adv::SecondaryChannel::OneM),
                 ..Default::default()
             };
             match self.adapter.advertise(adv).await {
