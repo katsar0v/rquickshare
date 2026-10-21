@@ -85,14 +85,11 @@ const QS_EINFO_IDENTITY: [u8; 16] = [
 // page that address first. We have no Classic socket (and the MAC copied from the
 // Pixel capture isn't ours), so that cost a 5-10 s page timeout on every send.
 const QS_CONN_MAC_EXTRA: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-// Mediums advertisement trailer: device_token(2) + extra(1) + appended presence DEs.
-const QS_MEDIUMS_TRAILING: [u8; 69] = [
-    0x62, 0xf1, 0x03, 0x00, 0x82, 0x3f, 0xa0, 0x17, 0xfd, 0xf1, 0x70, 0x59, 0x6e, 0x1e, 0xd3, 0x4d,
-    0xe0, 0x92, 0x56, 0x4d, 0x66, 0xd4, 0x29, 0x0f, 0x0f, 0x8f, 0x15, 0x05, 0x34, 0x7b, 0x13, 0x23,
-    0x01, 0xea, 0x7f, 0x92, 0xa8, 0xd8, 0xd4, 0x61, 0x84, 0x15, 0x05, 0x3f, 0x00, 0x00, 0x84, 0x15,
-    0x06, 0x2d, 0x00, 0x00, 0x84, 0x15, 0x04, 0x7f, 0x1f, 0x00, 0x84, 0x15, 0x07, 0x2d, 0x1f, 0x00,
-    0x83, 0x15, 0x01, 0x15, 0x7c,
-];
+// Mediums advertisement trailer: device_token(2) only. The Pixel capture also had
+// an extra-fields mask (0x03) advertising an L2CAP PSM (0x0082) and 63 bytes of
+// rx instant-connection data; we implement neither (only the GATT weave socket),
+// so advertising them could make a phone try a transport we can't serve.
+const QS_MEDIUMS_TRAILING: [u8; 2] = [0x62, 0xf1];
 
 /// Build the 0xFEF3 service data advertising this device as a QuickShare
 /// receiver endpoint. `endpoint_id` must be the same 4 bytes used by MDnsServer.
@@ -171,7 +168,7 @@ impl ReceiverAdvertiser {
                 // (BlueZ defaults to a slow ~1-2s interval).
                 min_interval: Some(std::time::Duration::from_millis(100)),
                 max_interval: Some(std::time::Duration::from_millis(150)),
-                // The ~125-byte service data only fits an extended (non-legacy)
+                // The service data (~45 bytes + device name) only fits an extended (non-legacy)
                 // advertising PDU; without a secondary channel the kernel uses a
                 // legacy PDU (31-byte limit) and rejects the set with
                 // "Invalid Parameters" (seen on an Intel controller, BlueZ 5.72).
@@ -180,6 +177,7 @@ impl ReceiverAdvertiser {
             };
             match self.adapter.advertise(adv).await {
                 Ok(handle) => {
+                    debug!("{RX_INNER_NAME}: advertisement registered");
                     tokio::select! {
                         _ = ctk.cancelled() => {
                             drop(handle);
