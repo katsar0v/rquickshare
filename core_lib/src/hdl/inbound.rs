@@ -1711,7 +1711,11 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         };
 
         // Plaintext CLIENT_INTRODUCTION → CLIENT_INTRODUCTION_ACK on the new socket.
-        let intro = read_frame_from(&mut tcp).await?;
+        // Bounded, so a stalled phone can't hold up the session (and its UI
+        // accept/decline actions) indefinitely.
+        let intro = tokio::time::timeout(Duration::from_secs(10), read_frame_from(&mut tcp))
+            .await
+            .map_err(|_| anyhow!("BWU: no CLIENT_INTRODUCTION within timeout"))??;
         if let Ok(f) = OfflineFrame::decode(&*intro) {
             debug!("BWU: TCP intro frame type={:?}", f.v1.as_ref().map(|v| v.r#type()));
         }
