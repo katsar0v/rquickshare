@@ -14,6 +14,20 @@
 
 ![demo image](.github/demo.png)
 
+> [!NOTE]
+> **Fork (`hotspot-ble` branch):** adds a Bluetooth LE receiver so Android can send
+> to Linux when the PC is connected to the **phone's own Wi-Fi hotspot** (where the
+> phone never looks for Quick Share devices over mDNS). The phone finds the PC over
+> BLE (0xFEF3 advert + GATT "weave" socket), then the transfer is upgraded to Wi-Fi
+> LAN over the hotspot. Used by [katsar0v/packet](https://github.com/katsar0v/packet).
+>
+> Based on Martin Alderson's [BLE receiver prototype](https://github.com/martinalderson/rquickshare/blob/feat/ble-receiver-connect-back/docs/BLE_RECEIVER_DISCOVERY.md)
+> (commits authored by him), on top of [nozwock/rquickshare](https://github.com/nozwock/rquickshare),
+> with fixes for: extended advertising (the ~125-byte advert was rejected as a
+> legacy PDU on Intel/BlueZ 5.72), a copied Bluetooth Classic MAC that made the
+> phone spin 5-10 s before connecting, and Docker/VPN addresses being offered for
+> the Wi-Fi upgrade. Tested with an OPPO Find X9 Pro (Android 16) as the hotspot.
+
 Installation
 --------------------------
 
