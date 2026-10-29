@@ -51,6 +51,16 @@ pub mod location_nearby_connections {
 static CUSTOM_DOWNLOAD: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
 static DEVICE_NAME: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())));
+// One endpoint id per process: a host app that restarts the service (e.g. when
+// Bluetooth is powered back on) must not show up as a second device on a phone
+// that is still holding on to the previous endpoint.
+static ENDPOINT_ID: Lazy<[u8; 4]> = Lazy::new(|| {
+    let mut id = [0u8; 4];
+    for (b, c) in id.iter_mut().zip(rand::rng().sample_iter(Alphanumeric)) {
+        *b = c;
+    }
+    id
+});
 
 #[derive(Debug)]
 pub struct RQS {
@@ -128,11 +138,7 @@ impl RQS {
         self.tracker = Some(tracker.clone());
         self.ctoken = Some(ctoken.clone());
 
-        let endpoint_id: Vec<u8> = rand::rng()
-            .sample_iter(Alphanumeric)
-            .take(4)
-            .map(u8::from)
-            .collect();
+        let endpoint_id: Vec<u8> = ENDPOINT_ID.to_vec();
         let tcp_listener =
             TcpListener::bind(format!("0.0.0.0:{}", self.port_number.unwrap_or(0))).await?;
         let binded_addr = tcp_listener.local_addr()?;
