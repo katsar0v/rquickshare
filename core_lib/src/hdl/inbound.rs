@@ -65,6 +65,90 @@ mod dest_name_tests {
     }
 }
 
+#[cfg(all(test, feature = "experimental", target_os = "linux"))]
+mod bwu_handover_tests {
+    use super::*;
+    use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+        ClientIntroduction, EventType,
+    };
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    fn intro_frame(endpoint_id: &str) -> Vec<u8> {
+        InboundRequest::<TcpStream>::bwu_frame(
+            EventType::ClientIntroduction,
+            None,
+            Some(ClientIntroduction {
+                endpoint_id: Some(endpoint_id.into()),
+                supports_disabling_encryption: None,
+            }),
+        )
+        .encode_to_vec()
+    }
+
+    /// Connects to `listener` as the phone would and sends a CLIENT_INTRODUCTION,
+    /// writing the length prefix and the frame separately.
+    async fn connect_and_introduce(listener: &TcpListener, endpoint_id: &str) -> TcpStream {
+        let addr = listener.local_addr().unwrap();
+        let frame = intro_frame(endpoint_id);
+        let mut phone = TcpStream::connect(addr).await.unwrap();
+        phone.set_nodelay(true).unwrap();
+        phone
+            .write_all(&(frame.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        phone.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        phone.write_all(&frame).await.unwrap();
+        phone
+    }
+
+    #[tokio::test]
+    async fn hands_upgraded_connection_to_waiting_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = BwuWaiter::register(Some("OTHR".into()));
+        let mut waiter = BwuWaiter::register(Some("AB12".into()));
+
+        let _phone = connect_and_introduce(&listener, "AB12").await;
+        let (socket, _) = listener.accept().await.unwrap();
+        let eid = peek_bwu_introduction(&socket).await;
+        assert_eq!(eid.as_deref(), Some("AB12"));
+        assert!(hand_over_bwu_connection("AB12", socket));
+
+        // The session gets the socket with the introduction still unread.
+        let mut tcp = tokio::time::timeout(Duration::from_secs(1), &mut waiter.rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_frame_from(&mut tcp).await.unwrap(),
+            intro_frame("AB12")
+        );
+
+        drop(other);
+        assert!(
+            !bwu_waiters()
+                .iter()
+                .any(|w| w.endpoint_id.as_deref() == Some("AB12"))
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_connection_is_not_an_introduction() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // A (bogus) regular first frame: length prefix + bytes that aren't a BWU intro.
+        client.write_all(&[0, 0, 0, 3, 1, 2, 3]).await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert_eq!(peek_bwu_introduction(&socket).await, None);
+        // Nothing was consumed.
+        let mut buf = [0u8; 7];
+        socket.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [0, 0, 0, 3, 1, 2, 3]);
+    }
+}
+
 /// Pick the on-disk name for a received file: keep the sender's name, but if its
 /// extension is missing or generic (e.g. a `.tmp` cache file), fix it from the
 /// declared MIME type so e.g. a PDF sent as `cache123.tmp` lands as `cache123.pdf`.
@@ -107,6 +191,99 @@ pub fn peek_client_introduction(buf: &[u8]) -> Option<String> {
         return None;
     }
     Some(bwu.client_introduction?.endpoint_id().to_string())
+}
+
+/// Peeks (without consuming) at the first frame of a new TCP connection and, if
+/// it's a bandwidth-upgrade CLIENT_INTRODUCTION, returns the peer's endpoint_id.
+/// Waits briefly for the whole frame: the length prefix can arrive on its own.
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub(crate) async fn peek_bwu_introduction(socket: &TcpStream) -> Option<String> {
+    // Plenty for a CLIENT_INTRODUCTION; anything longer is a regular transfer.
+    let mut buf = [0u8; 512];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let n = socket.peek(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        if n >= 4 {
+            let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if len == 0 || 4 + len > buf.len() {
+                return None;
+            }
+            if n >= 4 + len {
+                return peek_client_introduction(&buf[..n]);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A BLE session waiting for its phone to connect back over Wi-Fi.
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+struct BwuWaiterSlot {
+    token: u64,
+    endpoint_id: Option<String>,
+    tx: tokio::sync::oneshot::Sender<TcpStream>,
+}
+
+/// The bandwidth upgrade is offered on the main TCP listener's port, so the TCP
+/// server hands upgraded connections to the BLE sessions registered here.
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+static BWU_WAITERS: once_cell::sync::Lazy<std::sync::Mutex<Vec<BwuWaiterSlot>>> =
+    once_cell::sync::Lazy::new(Default::default);
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+fn bwu_waiters() -> std::sync::MutexGuard<'static, Vec<BwuWaiterSlot>> {
+    BWU_WAITERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Receives the phone's upgraded connection; unregisters itself when dropped.
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+struct BwuWaiter {
+    token: u64,
+    rx: tokio::sync::oneshot::Receiver<TcpStream>,
+}
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+impl BwuWaiter {
+    fn register(endpoint_id: Option<String>) -> Self {
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        bwu_waiters().push(BwuWaiterSlot {
+            token,
+            endpoint_id,
+            tx,
+        });
+        Self { token, rx }
+    }
+}
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+impl Drop for BwuWaiter {
+    fn drop(&mut self) {
+        bwu_waiters().retain(|w| w.token != self.token);
+    }
+}
+
+/// Hands a connection that introduced itself as `endpoint_id` to the BLE session
+/// waiting for it, or to the only waiting session if none matches by id.
+/// Returns false (dropping the socket) if no session is waiting.
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub(crate) fn hand_over_bwu_connection(endpoint_id: &str, socket: TcpStream) -> bool {
+    let slot = {
+        let mut waiters = bwu_waiters();
+        waiters
+            .iter()
+            .position(|w| w.endpoint_id.as_deref() == Some(endpoint_id))
+            .or_else(|| (waiters.len() == 1).then_some(0))
+            .map(|i| waiters.swap_remove(i))
+    };
+    slot.is_some_and(|w| w.tx.send(socket).is_ok())
 }
 
 /// Read one length-prefixed `[4-byte len][frame]` message from a stream (plaintext).
@@ -387,12 +564,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 let rdi = self.process_connection_request(&frame)?;
                 info!("RemoteDeviceInfo: {:?}", &rdi);
+                let endpoint_id = frame
+                    .v1
+                    .as_ref()
+                    .and_then(|v1| v1.connection_request.as_ref())
+                    .and_then(|req| req.endpoint_id.clone());
 
                 // Advance current state
                 self.update_state(
                     |e: &mut InnerState| {
                         e.state = TransferState::ReceivedConnectionRequest;
                         e.remote_device_info = Some(rdi);
+                        e.remote_endpoint_id = endpoint_id;
                     },
                     false,
                 )
@@ -1692,20 +1875,29 @@ impl InboundRequest<crate::hdl::MigratableStream> {
     pub async fn do_bwu(&mut self) -> Result<(), anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
 
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
-        let port = listener.local_addr()?.port();
+        // Offer the main TCP listener's port, so a firewall rule for the app's
+        // (static) port covers the upgrade too. The TCP server hands the phone's
+        // connection to us once it introduces itself. Register before offering,
+        // so a fast phone can't connect before we're waiting.
+        let port = self
+            .bwu_tcp_port
+            .ok_or_else(|| anyhow!("BWU: no TCP port to offer"))?;
+        let mut waiter = BwuWaiter::register(self.state.remote_endpoint_id.clone());
 
         // Offer WIFI_LAN over the encrypted BLE channel.
         self.send_upgrade_path_available(port).await?;
 
         // Wait for the phone to connect over TCP; if it doesn't, stay on BLE.
-        let mut tcp = match tokio::time::timeout(Duration::from_secs(15), listener.accept()).await {
-            Ok(Ok((s, peer))) => {
-                info!("BWU: phone connected over TCP from {peer}");
+        let mut tcp = match tokio::time::timeout(Duration::from_secs(15), &mut waiter.rx).await {
+            Ok(Ok(s)) => {
+                info!("BWU: phone connected over TCP from {:?}", s.peer_addr());
                 s
             }
             _ => {
-                warn!("BWU: no TCP upgrade within timeout; staying on BLE");
+                warn!(
+                    "BWU: phone didn't connect to TCP port {port} within timeout \
+                     (blocked by a firewall?); staying on BLE"
+                );
                 return Ok(());
             }
         };

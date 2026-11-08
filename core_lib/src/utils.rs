@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use get_if_addrs::get_if_addrs;
+use get_if_addrs::{IfAddr, Ifv4Addr, Interface, get_if_addrs};
 use hkdf::Hkdf;
 use num_bigint::{BigUint, ToBigInt};
 use p256::elliptic_curve::rand_core::OsRng;
@@ -212,20 +212,43 @@ fn is_virtual_if(name: &str) -> bool {
     VIRTUAL_IF_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// IPv4 address of this host to advertise as our Wi-Fi-LAN endpoint in a
-/// bandwidth-upgrade. Prefers the source address of the default route, then the
-/// first private address, never one on a container/VM/VPN interface (e.g. Docker
-/// bridges, which would otherwise win when they're listed before Wi-Fi).
-pub fn local_ipv4() -> Option<[u8; 4]> {
-    let addrs: Vec<Ipv4Addr> = get_if_addrs()
-        .ok()?
-        .into_iter()
+/// A tunnel or point-to-point link (WireGuard, Tailscale, Cloudflare WARP,
+/// OpenVPN tun, PPP...) has no broadcast address, and VPN clients usually assign
+/// it a /32. Catches tunnels whatever their interface is called.
+fn is_point_to_point(addr: &Ifv4Addr) -> bool {
+    addr.broadcast.is_none() || addr.netmask == Ipv4Addr::BROADCAST
+}
+
+/// Prefers the source address of the default route, then the first private
+/// address, then any.
+fn best_ipv4(addrs: &[Ipv4Addr], route_src: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    route_src
+        .filter(|v4| addrs.contains(v4))
+        .or_else(|| addrs.iter().copied().find(Ipv4Addr::is_private))
+        .or_else(|| addrs.first().copied())
+}
+
+/// Picks the address a phone on our Wi-Fi (or on its own hotspot) can reach.
+/// Container/VM bridges are never offered. Tunnels are only a last resort: a VPN
+/// that owns the default route would otherwise win over Wi-Fi.
+fn pick_lan_ipv4(ifaces: &[Interface], route_src: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    let (lan, tunnels): (Vec<&Ifv4Addr>, Vec<&Ifv4Addr>) = ifaces
+        .iter()
         .filter(|ia| !ia.is_loopback() && !is_virtual_if(&ia.name))
-        .filter_map(|ia| match ia.ip() {
-            std::net::IpAddr::V4(v4) if !v4.is_link_local() => Some(v4),
+        .filter_map(|ia| match &ia.addr {
+            IfAddr::V4(a) if !a.ip.is_link_local() => Some(a),
             _ => None,
         })
-        .collect();
+        .partition(|a| !is_point_to_point(a));
+    let ips = |addrs: Vec<&Ifv4Addr>| addrs.iter().map(|a| a.ip).collect::<Vec<_>>();
+
+    best_ipv4(&ips(lan), route_src).or_else(|| best_ipv4(&ips(tunnels), route_src))
+}
+
+/// IPv4 address of this host to advertise as our Wi-Fi-LAN endpoint in a
+/// bandwidth-upgrade.
+pub fn local_ipv4() -> Option<[u8; 4]> {
+    let ifaces = get_if_addrs().ok()?;
 
     // Connecting a UDP socket sends nothing; it only resolves the route's source.
     let route_src = std::net::UdpSocket::bind("0.0.0.0:0")
@@ -236,15 +259,8 @@ pub fn local_ipv4() -> Option<[u8; 4]> {
             std::net::IpAddr::V4(v4) => Some(v4),
             _ => None,
         });
-    if let Some(v4) = route_src.filter(|v4| addrs.contains(v4)) {
-        return Some(v4.octets());
-    }
 
-    addrs
-        .iter()
-        .find(|v4| v4.is_private())
-        .or(addrs.first())
-        .map(|v4| v4.octets())
+    pick_lan_ipv4(&ifaces, route_src).map(|v4| v4.octets())
 }
 
 pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {
@@ -289,5 +305,77 @@ mod tests {
 
         assert_eq!(parse_info.1, device_name);
         assert_eq!(parse_info.0, device_type);
+    }
+
+    fn lan(name: &str, ip: [u8; 4], prefix: u8) -> Interface {
+        let netmask = Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0));
+        let ip = Ipv4Addr::from(ip);
+        Interface {
+            name: name.into(),
+            addr: IfAddr::V4(Ifv4Addr {
+                ip,
+                netmask,
+                broadcast: Some(Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))),
+            }),
+        }
+    }
+
+    fn tunnel(name: &str, ip: [u8; 4], prefix: u8) -> Interface {
+        let mut iface = lan(name, ip, prefix);
+        if let IfAddr::V4(a) = &mut iface.addr {
+            a.broadcast = None;
+        }
+        iface
+    }
+
+    #[test]
+    fn lan_ipv4_skips_vpn_owning_default_route() {
+        // Cloudflare WARP: a /32 tun that owns the default route.
+        let ifaces = [
+            lan("lo", [127, 0, 0, 1], 8),
+            tunnel("CloudflareWARP", [172, 16, 0, 2], 32),
+            lan("wlan0", [10, 42, 0, 17], 24),
+        ];
+        let route_src = Some(Ipv4Addr::new(172, 16, 0, 2));
+        assert_eq!(
+            pick_lan_ipv4(&ifaces, route_src),
+            Some(Ipv4Addr::new(10, 42, 0, 17))
+        );
+    }
+
+    #[test]
+    fn lan_ipv4_skips_point_to_point_tunnels() {
+        // OpenVPN-style tun with a subnet but no broadcast address.
+        let ifaces = [
+            tunnel("vpn0", [10, 8, 0, 6], 24),
+            lan("enp3s0", [192, 168, 1, 20], 24),
+        ];
+        assert_eq!(
+            pick_lan_ipv4(&ifaces, None),
+            Some(Ipv4Addr::new(192, 168, 1, 20))
+        );
+    }
+
+    #[test]
+    fn lan_ipv4_uses_default_route_among_lan_links() {
+        let ifaces = [
+            lan("docker0", [172, 17, 0, 1], 16),
+            lan("enp3s0", [192, 168, 1, 20], 24),
+            lan("wlan0", [10, 42, 0, 17], 24),
+        ];
+        let route_src = Some(Ipv4Addr::new(10, 42, 0, 17));
+        assert_eq!(pick_lan_ipv4(&ifaces, route_src), route_src);
+    }
+
+    #[test]
+    fn lan_ipv4_falls_back_to_tunnel_when_nothing_else() {
+        let ifaces = [
+            lan("lo", [127, 0, 0, 1], 8),
+            tunnel("ppp0", [100, 64, 3, 9], 32),
+        ];
+        assert_eq!(
+            pick_lan_ipv4(&ifaces, None),
+            Some(Ipv4Addr::new(100, 64, 3, 9))
+        );
     }
 }

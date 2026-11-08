@@ -27,6 +27,9 @@
 > legacy PDU on Intel/BlueZ 5.72), a copied Bluetooth Classic MAC that made the
 > phone spin 5-10 s before connecting, and Docker/VPN addresses being offered for
 > the Wi-Fi upgrade. Tested with an OPPO Find X9 Pro (Android 16) as the hotspot.
+>
+> The Wi-Fi upgrade reuses the app's TCP port, so a firewall rule for a static
+> port (see [below](#my-firewall-is-blocking-the-connection)) covers it too.
 
 Installation
 --------------------------
