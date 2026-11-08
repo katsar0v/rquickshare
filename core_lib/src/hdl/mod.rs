@@ -67,6 +67,8 @@ pub struct InnerState {
     // Subject to be used-facing for progress, ...
     pub state: TransferState,
     pub remote_device_info: Option<RemoteDeviceInfo>,
+    /// The peer's Nearby endpoint id, from its ConnectionRequest.
+    pub remote_endpoint_id: Option<String>,
     pub pin_code: Option<String>,
     pub transfer_metadata: Option<TransferMetadata>,
     pub transferred_files: HashMap<i64, InternalFileInfo>,
